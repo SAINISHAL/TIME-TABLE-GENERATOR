@@ -5,7 +5,8 @@ import pandas as pd
 from file_manager import FileManager
 from config import DEPARTMENTS, TARGET_SEMESTERS, PRE_MID, POST_MID
 from excel_loader import ExcelLoader
-from openpyxl.styles import PatternFill
+from openpyxl.styles import PatternFill, Alignment, Font
+from openpyxl.utils import get_column_letter
 
 class ExcelExporter:
     """Handles exporting of timetables to Excel files."""
@@ -205,6 +206,91 @@ class ExcelExporter:
                     except Exception:
                         pass
     
+    def _format_worksheet(self, worksheet, is_timetable_sheet=False):
+        """Format worksheet to make text clearly visible.
+        
+        Args:
+            worksheet: openpyxl worksheet object
+            is_timetable_sheet: If True, applies special formatting for timetable grids
+        """
+        try:
+            # Set default alignment and text wrapping
+            alignment = Alignment(
+                horizontal='center',
+                vertical='center',
+                wrap_text=True
+            )
+            
+            # Default font
+            default_font = Font(size=10)
+            
+            # Apply formatting to all cells
+            for row in worksheet.iter_rows():
+                for cell in row:
+                    # Set alignment and wrapping for all cells
+                    cell.alignment = alignment
+                    
+                    # Set font size (preserve bold/italic/color if they exist)
+                    if cell.font:
+                        cell.font = Font(
+                            size=10,
+                            bold=cell.font.bold if cell.font.bold else False,
+                            italic=cell.font.italic if cell.font.italic else False,
+                            color=cell.font.color if cell.font.color else None
+                        )
+                    else:
+                        cell.font = default_font
+            
+            # Auto-adjust column widths
+            for column in worksheet.columns:
+                if not column:
+                    continue
+                    
+                max_length = 0
+                column_letter = get_column_letter(column[0].column)
+                
+                # Find the maximum length of content in the column
+                for cell in column:
+                    try:
+                        if cell.value is not None:
+                            # Convert to string and count characters
+                            cell_value = str(cell.value).strip()
+                            if cell_value:
+                                # Account for wrapped text - estimate width needed
+                                if '\n' in cell_value:
+                                    # For wrapped text, use the longest line
+                                    lines = cell_value.split('\n')
+                                    if lines:
+                                        max_line = max(len(line.strip()) for line in lines if line.strip())
+                                        max_length = max(max_length, max_line)
+                                else:
+                                    max_length = max(max_length, len(cell_value))
+                    except Exception:
+                        pass
+                
+                # Set column width with some padding
+                # Minimum width of 10, maximum of 50
+                adjusted_width = min(max(max_length + 2, 10), 50)
+                worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            # Set row heights for better visibility
+            # Header row (row 1) gets extra height
+            if worksheet.max_row > 0:
+                worksheet.row_dimensions[1].height = 25
+            
+            # For timetable sheets, set consistent row heights
+            if is_timetable_sheet:
+                for row_num in range(2, worksheet.max_row + 1):
+                    worksheet.row_dimensions[row_num].height = 30
+            
+            # For other sheets, set reasonable row heights
+            else:
+                for row_num in range(2, worksheet.max_row + 1):
+                    worksheet.row_dimensions[row_num].height = 20
+            
+        except Exception as e:
+            print(f"    WARNING: Could not format worksheet: {e}")
+    
     def _get_course_details_for_session(self, semester, department, session_type):
         """Get course details for a specific department and session.
         Validates that expected courses from division logic match what should be scheduled."""
@@ -368,14 +454,14 @@ class ExcelExporter:
     
     def _create_elective_classrooms_sheet(self, semester):
         """Create a sheet with elective courses and their assigned classrooms.
-        Each elective gets a different classroom.
+        Classrooms are assigned based on student registration and capacity.
         Reads from 'Elective data' sheet in course_data.xlsx.
         
         Args:
             semester: Semester number (1, 3, or 5)
         
         Returns:
-            DataFrame with columns: Course Code, Course Name, Faculty, Semester, Registered Students, Classroom
+            DataFrame with columns from Elective data sheet plus Classroom and Capacity
         """
         try:
             # Look for "Elective data" sheet in data frames
@@ -424,30 +510,78 @@ class ExcelExporter:
             # Prepare result with all columns from Elective data sheet
             result_df = sem_electives.copy()
             
-            # Assign different classrooms to each elective
-            room_pool = self._nonlab_classrooms or self._all_classrooms
-            if not room_pool:
-                print(f"    WARNING: No classrooms available for electives in semester {semester}")
+            # Get all non-lab classrooms sorted by capacity (ascending - prefer smaller rooms first)
+            all_rooms = sorted(self._nonlab_classrooms or self._all_classrooms, key=lambda x: x[1] if x[1] > 0 else 9999)
+            
+            if not all_rooms:
+                print(f"    WARNING: No classrooms available for elective courses in semester {semester}")
                 result_df['Classroom'] = ''
+                result_df['Capacity'] = 0
                 return result_df
             
-            room_names = [room_name for room_name, _ in room_pool]
-            if not room_names:
-                result_df['Classroom'] = ''
-                return result_df
+            # Find Registered Students column (case-insensitive)
+            registration_col = None
+            for colname in result_df.columns:
+                col_lower = str(colname).lower()
+                if any(k in col_lower for k in ['registered', 'students', 'enrollment', 'strength', 'capacity', 'count']):
+                    registration_col = colname
+                    break
             
-            # Assign unique classrooms
-            result_df = result_df.reset_index(drop=True)
+            if registration_col:
+                print(f"    INFO: Using '{registration_col}' column for student registration")
+            else:
+                print(f"    WARNING: No registration column found, will use default capacity matching")
+            
+            # Track assigned rooms to avoid duplicates within the same semester
+            used_rooms = set()
+            
+            # Add Classroom and Capacity columns
             result_df['Classroom'] = ''
+            result_df['Capacity'] = 0
             
-            for idx in range(len(result_df)):
-                if idx < len(room_names):
-                    result_df.iloc[idx, result_df.columns.get_loc('Classroom')] = room_names[idx]
-                else:
-                    # Recycle rooms if more electives than rooms
-                    result_df.iloc[idx, result_df.columns.get_loc('Classroom')] = room_names[idx % len(room_names)]
+            for idx, course in result_df.iterrows():
+                # Get registered students
+                registered = 0
+                if registration_col and registration_col in course.index:
+                    try:
+                        registered = int(float(course[registration_col])) if pd.notna(course[registration_col]) else 0
+                    except Exception:
+                        registered = 0
+                
+                # Find appropriate classroom based on capacity
+                assigned_room = ''
+                assigned_capacity = 0
+                
+                if registered > 0:
+                    # Find smallest available room that can accommodate the students
+                    for room_name, capacity in all_rooms:
+                        if room_name in used_rooms:
+                            continue  # Skip already assigned rooms
+                        if capacity >= registered or capacity == 0:  # Allow 0 capacity as fallback
+                            assigned_room = room_name
+                            assigned_capacity = capacity
+                            used_rooms.add(room_name)
+                            break
+                
+                # If no suitable room found (all used or no registration data), assign smallest available
+                if not assigned_room:
+                    for room_name, capacity in all_rooms:
+                        if room_name not in used_rooms:
+                            assigned_room = room_name
+                            assigned_capacity = capacity
+                            used_rooms.add(room_name)
+                            break
+                
+                # Final fallback: use first room even if already used
+                if not assigned_room and all_rooms:
+                    assigned_room, assigned_capacity = all_rooms[0]
+                
+                result_df.at[idx, 'Classroom'] = assigned_room
+                result_df.at[idx, 'Capacity'] = assigned_capacity
             
-            print(f"    Assigned {len(result_df)} elective classrooms for semester {semester}")
+            if not result_df.empty:
+                print(f"    Assigned {len(result_df)} elective classrooms for semester {semester} based on student registration")
+            
             return result_df
             
         except Exception as e:
@@ -682,6 +816,13 @@ class ExcelExporter:
                             # Write course details table
                             course_details.to_excel(w, sheet_name=sheet_name, index=False, startrow=start_row+1)
                         
+                        # Format the worksheet for better visibility
+                        try:
+                            ws = w.sheets[sheet_name]
+                            self._format_worksheet(ws, is_timetable_sheet=True)
+                        except Exception as e:
+                            print(f"    WARNING: Could not format {sheet_name}: {e}")
+                        
                         print(f"    SUCCESS: {sheet_name} created with course details")
                         department_count += 1
                     else:
@@ -724,6 +865,13 @@ class ExcelExporter:
                             # Write course details table
                             course_details.to_excel(w, sheet_name=sheet_name, index=False, startrow=start_row+1)
                         
+                        # Format the worksheet for better visibility
+                        try:
+                            ws = w.sheets[sheet_name]
+                            self._format_worksheet(ws, is_timetable_sheet=True)
+                        except Exception as e:
+                            print(f"    WARNING: Could not format {sheet_name}: {e}")
+                        
                         print(f"    SUCCESS: {sheet_name} created with course details")
                         department_count += 1
                     else:
@@ -735,6 +883,12 @@ class ExcelExporter:
                         elective_classrooms_df = self._create_elective_classrooms_sheet(semester)
                         if not elective_classrooms_df.empty:
                             elective_classrooms_df.to_excel(w, sheet_name='Elective_Classrooms', index=False)
+                            # Format the Elective Classrooms sheet
+                            try:
+                                ws = w.sheets['Elective_Classrooms']
+                                self._format_worksheet(ws, is_timetable_sheet=False)
+                            except Exception as e:
+                                print(f"  WARNING: Could not format Elective_Classrooms sheet: {e}")
                             print(f"  - Elective Classrooms sheet created with {len(elective_classrooms_df)} courses")
                         else:
                             print(f"  - No electives found for semester {semester}")
@@ -748,6 +902,12 @@ class ExcelExporter:
                         minor_classrooms_df = self._create_minor_classrooms_sheet(semester)
                         if not minor_classrooms_df.empty:
                             minor_classrooms_df.to_excel(w, sheet_name='Minor_Classrooms', index=False)
+                            # Format the Minor Classrooms sheet
+                            try:
+                                ws = w.sheets['Minor_Classrooms']
+                                self._format_worksheet(ws, is_timetable_sheet=False)
+                            except Exception as e:
+                                print(f"  WARNING: Could not format Minor_Classrooms sheet: {e}")
                             print(f"  ✓ Minor Classrooms sheet created with {len(minor_classrooms_df)} entries")
                         else:
                             print(f"  - No minor courses found in course data for semester {semester} (sheet not created)")
@@ -755,6 +915,14 @@ class ExcelExporter:
                         print(f"  ERROR: Could not create Minor Classrooms sheet: {e}")
                         import traceback
                         traceback.print_exc()
+                
+                # Format Course_Summary sheet
+                try:
+                    if 'Course_Summary' in w.sheets:
+                        ws = w.sheets['Course_Summary']
+                        self._format_worksheet(ws, is_timetable_sheet=False)
+                except Exception as e:
+                    print(f"  WARNING: Could not format Course_Summary sheet: {e}")
                 
                 print(f"\nSUCCESS: Created {filename}")
                 print(f"  - {department_count} department schedules")
@@ -977,6 +1145,13 @@ class ExcelExporter:
                 except Exception as e:
                     print(f"    WARNING: Could not apply color coding: {e}")
                 
+                # Format the Timetable sheet
+                try:
+                    ws = w.sheets['Timetable']
+                    self._format_worksheet(ws, is_timetable_sheet=True)
+                except Exception as e:
+                    print(f"    WARNING: Could not format Timetable sheet: {e}")
+                
                 print(f"    SUCCESS: Main timetable created with {len(basket_codes)} baskets")
                 
                 # 2. Create basket assignments sheet
@@ -1068,6 +1243,14 @@ class ExcelExporter:
                     basket_assignments = self._assign_course_rooms_within_baskets(basket_assignments)
                 
                 basket_assignments.to_excel(w, sheet_name='Basket_Assignments', index=False)
+                
+                # Format the Basket_Assignments sheet
+                try:
+                    ws = w.sheets['Basket_Assignments']
+                    self._format_worksheet(ws, is_timetable_sheet=False)
+                except Exception as e:
+                    print(f"    WARNING: Could not format Basket_Assignments sheet: {e}")
+                
                 print(f"    SUCCESS: Basket assignments sheet created with {len(basket_assignments)} entries")
                 
                 print(f"\nSUCCESS: Created {filename}")

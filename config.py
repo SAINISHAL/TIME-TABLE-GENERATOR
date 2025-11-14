@@ -28,7 +28,7 @@ DAYS = ['MON', 'TUE', 'WED', 'THU', 'FRI']
 
 # Teaching time slots in 30-minute increments (07:30 - 17:30)
 TEACHING_SLOTS = [
-    '07:30-08:00', '08:00-08:30', '08:30-09:00',
+    '07:30-08:00', '08:00-08:30',
     '09:00-09:30', '09:30-10:00', '10:00-10:30',
     '10:30-11:00', '11:00-11:30', '11:30-12:00',
     '12:00-12:30', '12:30-13:00',
@@ -36,12 +36,25 @@ TEACHING_SLOTS = [
     '14:00-14:30', '14:30-15:00',
     '15:00-15:30', '15:30-16:00',
     '16:00-16:30', '16:30-17:00',
-    '17:00-17:30'
+    '17:00-17:30','17:30-18:00',
+    '18:00-18:30', '18:30-19:00',
+    
 ]
 
 # Lunch and Minor slot definitions
 LUNCH_SLOTS = ['13:00-13:30', '13:30-14:00']
 MINOR_SLOTS = ['07:30-08:00', '08:00-08:30']  # 07:30-08:30 represented as two 30-min slots
+
+# Slot prioritization: preferred slots (before 4:30 PM) and extended slots (4:30-6:30 PM)
+# Preferred slots are tried first, extended slots only if needed
+# Preferred slots: classes should finish by 4:30 PM (16:30)
+#   For a 1.5h class (3 slots), to finish by 16:30, it must start at or before 15:00-15:30
+#   For a 1h class (2 slots), to finish by 16:30, it must start at or before 15:30-16:00
+#   For a 2h class (4 slots), to finish by 16:30, it must start at or before 14:30-15:00
+# Extended slots: 4:30 PM (16:30) to 6:30 PM (18:30) - only used if preferred slots are full
+PREFERRED_SLOTS_END = '16:00-16:30'  # Last preferred slot (classes finish by 4:30 PM)
+EXTENDED_SLOTS_START = '16:30-17:00'  # First extended slot (4:30 PM onwards)
+EXTENDED_SLOTS_END = '18:30-19:00'  # Last extended slot (6:30 PM)
 
 # Class durations (counted in 30-minute slots)
 LECTURE_DURATION = 3    # 1.5 hours = 3 slots

@@ -3,7 +3,7 @@ import pandas as pd
 import random
 from config import DAYS, TEACHING_SLOTS, LECTURE_DURATION, TUTORIAL_DURATION, LAB_DURATION, MINOR_DURATION
 from config import PRE_MID, POST_MID, MINOR_SUBJECT, MINOR_CLASSES_PER_WEEK, DEPARTMENTS
-from config import MINOR_SLOTS, LUNCH_SLOTS
+from config import MINOR_SLOTS, LUNCH_SLOTS, PREFERRED_SLOTS_END, EXTENDED_SLOTS_START, EXTENDED_SLOTS_END
 from excel_loader import ExcelLoader
 
 class ScheduleGenerator:
@@ -113,6 +113,42 @@ class ScheduleGenerator:
         except ValueError:
             pass
         return []
+    
+    def _get_preferred_and_extended_slots(self, duration):
+        """Get preferred slots (before 4:30 PM) and extended slots (4:30-6:30 PM).
+        Returns tuple: (preferred_slots, extended_slots)
+        Preferred slots are those where classes finish by 4:30 PM.
+        Extended slots are from 4:30 PM to 6:30 PM."""
+        regular_slots = [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
+        
+        # Find the index of the last preferred slot
+        try:
+            preferred_end_idx = TEACHING_SLOTS.index(PREFERRED_SLOTS_END)
+            extended_start_idx = TEACHING_SLOTS.index(EXTENDED_SLOTS_START)
+            extended_end_idx = TEACHING_SLOTS.index(EXTENDED_SLOTS_END)
+        except ValueError:
+            # If slots not found, use all regular slots as preferred
+            return regular_slots, []
+        
+        preferred_slots = []
+        extended_slots = []
+        
+        # Build preferred slots: slots where classes finish by 4:30 PM
+        for i, slot in enumerate(regular_slots):
+            if slot not in TEACHING_SLOTS:
+                continue
+            slot_idx = TEACHING_SLOTS.index(slot)
+            # Check if a class starting at this slot would finish by 4:30 PM
+            # A class of 'duration' slots starting at slot_idx would end at slot_idx + duration - 1
+            if slot_idx + duration - 1 <= preferred_end_idx:
+                preferred_slots.append(slot)
+            # Extended slots: from 4:30 PM to 6:30 PM
+            elif extended_start_idx <= slot_idx <= extended_end_idx:
+                # Check if a class starting here would finish within extended range
+                if slot_idx + duration - 1 <= extended_end_idx:
+                    extended_slots.append(slot)
+        
+        return preferred_slots, extended_slots
     
     def _get_dept_from_global_key(self, dept_key):
         """Extract department label from a global slot key (e.g., 'CSE-A' from 'CSE-A_Pre-Mid')."""
@@ -281,7 +317,11 @@ class ScheduleGenerator:
         max_attempts = 2000  # Increased attempts for better allocation
         used_days = set()
         avoid_days = set(avoid_days or [])
-        regular_slots = [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
+        
+        # Get preferred and extended slots (prioritize slots before 4:30 PM)
+        preferred_slots, extended_slots = self._get_preferred_and_extended_slots(LECTURE_DURATION)
+        # Fallback to all regular slots if preferred/extended not available
+        regular_slots = preferred_slots + extended_slots if (preferred_slots or extended_slots) else [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
         
         # For combined classes, check if paired department has already scheduled this
         if is_combined and paired_dept and group_key:
@@ -315,17 +355,29 @@ class ScheduleGenerator:
                             break
 
         # Build list of all possible (day, start_slot) combinations
-        all_combinations = []
-        for day in DAYS:
-            for start_idx in range(len(regular_slots) - LECTURE_DURATION + 1):
-                start_slot = regular_slots[start_idx]
-                slots = self._get_consecutive_slots(start_slot, LECTURE_DURATION)
-                slots = [slot for slot in slots if slot in regular_slots]
-                if len(slots) == LECTURE_DURATION:
-                    all_combinations.append((day, start_slot, slots))
+        # Prioritize preferred slots first, then extended slots
+        preferred_combinations = []
+        extended_combinations = []
         
-        # Shuffle combinations for randomness
-        random.shuffle(all_combinations)
+        for day in DAYS:
+            # First, try preferred slots (before 4:30 PM)
+            for start_slot in preferred_slots:
+                slots = self._get_consecutive_slots(start_slot, LECTURE_DURATION)
+                slots = [slot for slot in slots if slot in preferred_slots]
+                if len(slots) == LECTURE_DURATION:
+                    preferred_combinations.append((day, start_slot, slots))
+            
+            # Then, try extended slots (4:30-6:30 PM)
+            for start_slot in extended_slots:
+                slots = self._get_consecutive_slots(start_slot, LECTURE_DURATION)
+                slots = [slot for slot in slots if slot in extended_slots]
+                if len(slots) == LECTURE_DURATION:
+                    extended_combinations.append((day, start_slot, slots))
+        
+        # Shuffle each group for randomness, but keep preferred first
+        random.shuffle(preferred_combinations)
+        random.shuffle(extended_combinations)
+        all_combinations = preferred_combinations + extended_combinations
 
         while len(scheduled_slots) < lectures_per_week * LECTURE_DURATION and attempts < max_attempts:
             attempts += 1
@@ -401,16 +453,27 @@ class ScheduleGenerator:
         attempts = 0
         max_attempts = 500  # Increased for better success rate
         used_days = set()
+        
+        # Get preferred and extended slots (prioritize slots before 4:30 PM)
+        preferred_slots, extended_slots = self._get_preferred_and_extended_slots(LECTURE_DURATION)
+        # Fallback to all regular slots if preferred/extended not available
+        regular_slots = preferred_slots + extended_slots if (preferred_slots or extended_slots) else [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
+        
         while scheduled < lectures_per_week and attempts < max_attempts:
             attempts += 1
             available_days = [d for d in DAYS if d not in used_days]
             if not available_days:
                 break
             day = random.choice(available_days)
-            regular_slots = [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
             if not regular_slots:
                 break
-            start_slot = random.choice(regular_slots)
+            # Prioritize preferred slots, then extended slots
+            if preferred_slots and attempts < max_attempts * 0.8:  # Try preferred slots for 80% of attempts
+                start_slot = random.choice(preferred_slots)
+            elif extended_slots:
+                start_slot = random.choice(extended_slots)
+            else:
+                start_slot = random.choice(regular_slots)
             slots = self._get_consecutive_slots(start_slot, LECTURE_DURATION)
             slots = [slot for slot in slots if slot in regular_slots]
             if (len(slots) == LECTURE_DURATION and 
@@ -610,20 +673,36 @@ class ScheduleGenerator:
         max_attempts = 1000
         used_days = set()
         avoid_days = set(avoid_days or [])
-        regular_slots = [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
+        
+        # Get preferred and extended slots (prioritize slots before 4:30 PM)
+        preferred_slots, extended_slots = self._get_preferred_and_extended_slots(TUTORIAL_DURATION)
+        # Fallback to all regular slots if preferred/extended not available
+        regular_slots = preferred_slots + extended_slots if (preferred_slots or extended_slots) else [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
 
         # Build list of all possible (day, start_slot) combinations
-        all_combinations = []
-        for day in DAYS:
-            for start_idx in range(len(regular_slots) - TUTORIAL_DURATION + 1):
-                start_slot = regular_slots[start_idx]
-                slots = self._get_consecutive_slots(start_slot, TUTORIAL_DURATION)
-                slots = [slot for slot in slots if slot in regular_slots]
-                if len(slots) == TUTORIAL_DURATION:
-                    all_combinations.append((day, start_slot, slots))
+        # Prioritize preferred slots first, then extended slots
+        preferred_combinations = []
+        extended_combinations = []
         
-        # Shuffle combinations for randomness
-        random.shuffle(all_combinations)
+        for day in DAYS:
+            # First, try preferred slots (before 4:30 PM)
+            for start_slot in preferred_slots:
+                slots = self._get_consecutive_slots(start_slot, TUTORIAL_DURATION)
+                slots = [slot for slot in slots if slot in preferred_slots]
+                if len(slots) == TUTORIAL_DURATION:
+                    preferred_combinations.append((day, start_slot, slots))
+            
+            # Then, try extended slots (4:30-6:30 PM)
+            for start_slot in extended_slots:
+                slots = self._get_consecutive_slots(start_slot, TUTORIAL_DURATION)
+                slots = [slot for slot in slots if slot in extended_slots]
+                if len(slots) == TUTORIAL_DURATION:
+                    extended_combinations.append((day, start_slot, slots))
+        
+        # Shuffle each group for randomness, but keep preferred first
+        random.shuffle(preferred_combinations)
+        random.shuffle(extended_combinations)
+        all_combinations = preferred_combinations + extended_combinations
 
         while len(scheduled_slots) < tutorials_per_week * TUTORIAL_DURATION and attempts < max_attempts:
             attempts += 1
@@ -663,19 +742,34 @@ class ScheduleGenerator:
         max_attempts = 1000  # Increased for better success rate
         used_days = set()
         avoid_days = set(avoid_days or [])
-        regular_slots = [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
+        
+        # Get preferred and extended slots (prioritize slots before 4:30 PM)
+        preferred_slots, extended_slots = self._get_preferred_and_extended_slots(LAB_DURATION)
+        # Fallback to all regular slots if preferred/extended not available
+        regular_slots = preferred_slots + extended_slots if (preferred_slots or extended_slots) else [slot for slot in TEACHING_SLOTS if slot not in (MINOR_SLOTS + LUNCH_SLOTS)]
         
         # Build list of all possible (day, start_slot) combinations for labs
-        all_combinations = []
-        for day in DAYS:
-            for i in range(0, len(regular_slots) - LAB_DURATION + 1):
-                start = regular_slots[i]
-                seq = self._get_consecutive_slots(start, LAB_DURATION)
-                if len(seq) == LAB_DURATION and all(s in regular_slots for s in seq):
-                    all_combinations.append((day, start, seq))
+        # Prioritize preferred slots first, then extended slots
+        preferred_combinations = []
+        extended_combinations = []
         
-        # Shuffle combinations for randomness
-        random.shuffle(all_combinations)
+        for day in DAYS:
+            # First, try preferred slots (before 4:30 PM)
+            for start in preferred_slots:
+                seq = self._get_consecutive_slots(start, LAB_DURATION)
+                if len(seq) == LAB_DURATION and all(s in preferred_slots for s in seq):
+                    preferred_combinations.append((day, start, seq))
+            
+            # Then, try extended slots (4:30-6:30 PM)
+            for start in extended_slots:
+                seq = self._get_consecutive_slots(start, LAB_DURATION)
+                if len(seq) == LAB_DURATION and all(s in extended_slots for s in seq):
+                    extended_combinations.append((day, start, seq))
+        
+        # Shuffle each group for randomness, but keep preferred first
+        random.shuffle(preferred_combinations)
+        random.shuffle(extended_combinations)
+        all_combinations = preferred_combinations + extended_combinations
         
         while len(scheduled_slots) < labs_per_week * LAB_DURATION and attempts < max_attempts:
             attempts += 1
